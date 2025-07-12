@@ -75,6 +75,10 @@ type messagesComponent struct {
 	// Orphaned tool calls mapping (for interim output)  
 	// Maps message index to orphaned tool calls that should be attached to that message
 	orphanedToolCallsMap map[int][]opencode.ToolPart
+	
+	// Orphaned tool calls cache state
+	orphanedToolCallsValid bool
+	lastMessageSignature   string
 }
 
 type renderFinishedMsg struct{}
@@ -110,14 +114,14 @@ func (m *messagesComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.invalidateMessageInfos()
 		return m, m.Reload()
 	case dialog.ThemeSelectedMsg:
-		// Instead of clearing entire cache, just invalidate rendering
+		// Only invalidate rendering, not orphaned tool calls
 		m.rendering = true
-		m.invalidateMessageInfos()
+		m.invalidateForThemeChange()
 		return m, m.Reload()
 	case ToggleToolDetailsMsg:
 		m.showToolDetails = !m.showToolDetails
 		m.rendering = true
-		m.invalidateMessageInfos()
+		m.invalidateForToolDetailsChange()
 		return m, m.Reload()
 	case app.SessionLoadedMsg, app.SessionClearedMsg:
 		m.cache.Clear()
@@ -174,8 +178,45 @@ func (m *messagesComponent) invalidateMessageInfos() {
 		m.messageInfos[i].NeedsUpdate = true
 	}
 	m.needsRecalculation = true
-	// Also clear orphaned tool calls map since message structure changed
+	// Invalidate orphaned tool calls cache since message structure changed
+	m.invalidateOrphanedToolCalls()
+}
+
+// invalidateOrphanedToolCalls marks the orphaned tool calls cache as invalid
+func (m *messagesComponent) invalidateOrphanedToolCalls() {
+	m.orphanedToolCallsValid = false
+	m.lastMessageSignature = ""
+	// Clear the map to free memory
 	m.orphanedToolCallsMap = make(map[int][]opencode.ToolPart)
+}
+
+// generateMessageSignature creates a signature that changes when message structure changes
+func (m *messagesComponent) generateMessageSignature() string {
+	if len(m.app.Messages) == 0 {
+		return "empty"
+	}
+	
+	// Create a signature that captures structural changes
+	signature := fmt.Sprintf("count:%d", len(m.app.Messages))
+	
+	for i, message := range m.app.Messages {
+		switch casted := message.(type) {
+		case opencode.AssistantMessage:
+			signature += fmt.Sprintf(";msg:%d:id:%s:completed:%d:parts:%d", 
+				i, casted.ID, casted.Time.Completed, len(casted.Parts))
+			// Add tool part states since they affect orphaned status
+			for j, part := range casted.Parts {
+				if tool, ok := part.AsUnion().(opencode.ToolPart); ok {
+					signature += fmt.Sprintf(";tool:%d:%s:%s", j, tool.ID, tool.State.Status)
+				}
+			}
+		case opencode.UserMessage:
+			signature += fmt.Sprintf(";msg:%d:id:%s:parts:%d", 
+				i, casted.ID, len(casted.Parts))
+		}
+	}
+	
+	return signature
 }
 
 // invalidateForThemeChange marks messages that need re-rendering due to theme change
@@ -186,6 +227,7 @@ func (m *messagesComponent) invalidateForThemeChange() {
 		m.messageInfos[i].NeedsUpdate = true
 	}
 	m.needsRecalculation = true
+	// Note: Don't invalidate orphaned tool calls for theme changes
 }
 
 // invalidateForToolDetailsChange marks messages that need re-rendering due to tool details change
@@ -197,6 +239,7 @@ func (m *messagesComponent) invalidateForToolDetailsChange() {
 		}
 	}
 	m.needsRecalculation = true
+	// Note: Don't invalidate orphaned tool calls for tool details visibility changes
 }
 
 // calculateVisibleRange determines which messages are currently visible
@@ -895,6 +938,8 @@ func NewMessagesComponent(app *app.App) MessagesComponent {
 		messageInfos:      make([]MessageInfo, 0),
 		renderThrottle:    16 * time.Millisecond, // ~60 FPS
 		orphanedToolCallsMap: make(map[int][]opencode.ToolPart),
+		orphanedToolCallsValid: false, // Will be calculated on first render
+		lastMessageSignature:   "",
 	}
 }
 
@@ -922,7 +967,18 @@ func min(a, b int) int {
 
 // processOrphanedToolCalls processes all messages to build a map of orphaned tool calls
 // This maintains the interim output (planning, tool usage, thoughts) logic
+// Now cached to avoid O(n) processing on every render
 func (m *messagesComponent) processOrphanedToolCalls() {
+	// Check if cache is still valid
+	currentSignature := m.generateMessageSignature()
+	if m.orphanedToolCallsValid && m.lastMessageSignature == currentSignature {
+		// Cache is valid, no need to recalculate
+		util.Measure("orphaned.cache_hit")("totalMessages", len(m.app.Messages))
+		return
+	}
+	
+	// Cache is invalid, recalculate
+	util.Measure("orphaned.cache_miss")("totalMessages", len(m.app.Messages))
 	m.orphanedToolCallsMap = make(map[int][]opencode.ToolPart)
 	orphanedToolCalls := make([]opencode.ToolPart, 0)
 	
@@ -967,6 +1023,10 @@ func (m *messagesComponent) processOrphanedToolCalls() {
 	
 	// Debug: final state
 	util.Measure("orphaned.final")("mapSize", len(m.orphanedToolCallsMap), "pendingOrphaned", len(orphanedToolCalls))
+	
+	// Mark cache as valid
+	m.orphanedToolCallsValid = true
+	m.lastMessageSignature = currentSignature
 }
 
 // getOrphanedToolCallsForMessage returns orphaned tool calls that should be
