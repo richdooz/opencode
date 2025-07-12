@@ -202,7 +202,7 @@ func (m *messagesComponent) calculateVisibleRange() {
 	}
 
 	viewportTop := m.viewport.YOffset
-	viewportBottom := viewportTop + m.viewport.Height
+	viewportBottom := viewportTop + m.viewport.Height()
 
 	// Find first visible message
 	m.visibleStart = 0
@@ -365,7 +365,6 @@ func (m *messagesComponent) renderView(width int) {
 	}
 
 	// Render visible messages
-	orphanedToolCalls := make([]opencode.ToolPart, 0)
 	for i := m.visibleStart; i <= m.visibleEnd && i < len(m.app.Messages); i++ {
 		message := m.app.Messages[i]
 		content := m.renderSingleMessage(message, i, false)
@@ -548,7 +547,7 @@ func (m *messagesComponent) renderSingleMessage(message opencode.MessageUnion, m
 			case opencode.ToolPart:
 				if !m.showToolDetails {
 					if !hasTextPart {
-						// orphanedToolCalls = append(orphanedToolCalls, part)
+					// Note: orphaned tool calls would be handled here if needed
 					}
 					continue
 				}
