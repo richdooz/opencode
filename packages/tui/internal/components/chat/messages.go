@@ -72,9 +72,9 @@ type messagesComponent struct {
 	lastRenderTime  time.Time
 	renderThrottle  time.Duration
 	
-	// Orphaned tool calls state (for interim output)  
-	// These represent tool calls that occur without associated text (planning, tool usage, etc.)
-	orphanedToolCalls []opencode.ToolPart
+	// Orphaned tool calls mapping (for interim output)  
+	// Maps message index to orphaned tool calls that should be attached to that message
+	orphanedToolCallsMap map[int][]opencode.ToolPart
 }
 
 type renderFinishedMsg struct{}
@@ -174,6 +174,8 @@ func (m *messagesComponent) invalidateMessageInfos() {
 		m.messageInfos[i].NeedsUpdate = true
 	}
 	m.needsRecalculation = true
+	// Also clear orphaned tool calls map since message structure changed
+	m.orphanedToolCallsMap = make(map[int][]opencode.ToolPart)
 }
 
 // invalidateForThemeChange marks messages that need re-rendering due to theme change
@@ -853,7 +855,7 @@ func NewMessagesComponent(app *app.App) MessagesComponent {
 		bufferSize:        3, // Render 3 extra messages above/below viewport
 		messageInfos:      make([]MessageInfo, 0),
 		renderThrottle:    16 * time.Millisecond, // ~60 FPS
-		orphanedToolCalls: make([]opencode.ToolPart, 0),
+		orphanedToolCallsMap: make(map[int][]opencode.ToolPart),
 	}
 }
 
@@ -879,27 +881,37 @@ func min(a, b int) int {
 	return b
 }
 
-// processOrphanedToolCalls processes all messages to collect orphaned tool calls
+// processOrphanedToolCalls processes all messages to build a map of orphaned tool calls
 // This maintains the interim output (planning, tool usage, thoughts) logic
 func (m *messagesComponent) processOrphanedToolCalls() {
-	m.orphanedToolCalls = make([]opencode.ToolPart, 0)
+	m.orphanedToolCallsMap = make(map[int][]opencode.ToolPart)
+	orphanedToolCalls := make([]opencode.ToolPart, 0)
 	
-	for _, message := range m.app.Messages {
+	for messageIndex, message := range m.app.Messages {
 		switch casted := message.(type) {
 		case opencode.AssistantMessage:
 			hasTextPart := false
+			
+			// First pass: check if this message has any text parts
 			for _, p := range casted.Parts {
-				switch part := p.AsUnion().(type) {
-				case opencode.TextPart:
+				if _, ok := p.AsUnion().(opencode.TextPart); ok {
 					hasTextPart = true
-					// Clear orphaned tool calls when we hit a text part
-					// (they'll be attached to this assistant message)
-					m.orphanedToolCalls = make([]opencode.ToolPart, 0)
-				case opencode.ToolPart:
-					if !hasTextPart {
-						// Tool calls without preceding text parts are "orphaned"
-						// These represent interim AI activity (planning, tool usage, etc.)
-						m.orphanedToolCalls = append(m.orphanedToolCalls, part)
+					break
+				}
+			}
+			
+			// If this message has text parts, attach all accumulated orphaned tool calls
+			if hasTextPart && len(orphanedToolCalls) > 0 {
+				m.orphanedToolCallsMap[messageIndex] = make([]opencode.ToolPart, len(orphanedToolCalls))
+				copy(m.orphanedToolCallsMap[messageIndex], orphanedToolCalls)
+				orphanedToolCalls = make([]opencode.ToolPart, 0) // Clear after attaching
+			}
+			
+			// If this message has no text parts, collect its tool calls as orphaned
+			if !hasTextPart {
+				for _, p := range casted.Parts {
+					if tool, ok := p.AsUnion().(opencode.ToolPart); ok {
+						orphanedToolCalls = append(orphanedToolCalls, tool)
 					}
 				}
 			}
@@ -910,60 +922,8 @@ func (m *messagesComponent) processOrphanedToolCalls() {
 // getOrphanedToolCallsForMessage returns orphaned tool calls that should be
 // included with the specified message (by index)
 func (m *messagesComponent) getOrphanedToolCallsForMessage(messageIndex int) []opencode.ToolPart {
-	if messageIndex >= len(m.app.Messages) {
-		return nil
+	if orphaned, exists := m.orphanedToolCallsMap[messageIndex]; exists {
+		return orphaned
 	}
-	
-	message := m.app.Messages[messageIndex]
-	assistant, ok := message.(opencode.AssistantMessage)
-	if !ok {
-		return nil
-	}
-	
-	// Check if this assistant message has a text part
-	hasTextPart := false
-	for _, p := range assistant.Parts {
-		if _, ok := p.AsUnion().(opencode.TextPart); ok {
-			hasTextPart = true
-			break
-		}
-	}
-	
-	// Only return orphaned tool calls for assistant messages with text parts
-	// (this is where the interim output gets attached)
-	if hasTextPart {
-		// Find orphaned tool calls that occurred before this message
-		orphanedForThis := make([]opencode.ToolPart, 0)
-		
-		// Look at messages before this one to collect orphaned tool calls
-		for i := messageIndex - 1; i >= 0; i-- {
-			prevMessage := m.app.Messages[i]
-			if prevAssistant, ok := prevMessage.(opencode.AssistantMessage); ok {
-				// Check if previous assistant message had text parts
-				prevHasTextPart := false
-				for _, p := range prevAssistant.Parts {
-					if _, ok := p.AsUnion().(opencode.TextPart); ok {
-						prevHasTextPart = true
-						break
-					}
-				}
-				
-				// If previous message had text, stop looking backwards
-				if prevHasTextPart {
-					break
-				}
-				
-				// Collect tool calls from messages without text parts
-				for _, p := range prevAssistant.Parts {
-					if tool, ok := p.AsUnion().(opencode.ToolPart); ok {
-						orphanedForThis = append([]opencode.ToolPart{tool}, orphanedForThis...)
-					}
-				}
-			}
-		}
-		
-		return orphanedForThis
-	}
-	
 	return nil
 }
