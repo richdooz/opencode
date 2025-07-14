@@ -162,6 +162,13 @@ func (m *messagesComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.GotoBottom()
 			}
 		}
+	case opencode.EventListResponseEventMessagePartUpdated:
+		if msg.Properties.Part.SessionID == m.app.Session.ID {
+			m.renderView(m.width)
+			if m.tail {
+				m.viewport.GotoBottom()
+			}
+		}
 	}
 
 	viewport, cmd := m.viewport.Update(msg)
@@ -419,25 +426,195 @@ func (m *messagesComponent) renderView(width int) {
 		}
 	}
 
-	// Process all messages to collect orphaned tool calls
-	m.processOrphanedToolCalls()
-	
-	// Render visible messages
-	for i := m.visibleStart; i <= m.visibleEnd && i < len(m.app.Messages); i++ {
-		message := m.app.Messages[i]
-		messageBlocks := m.renderSingleMessage(message, i, false)
-		
-		// Add all blocks from this message
-		for _, content := range messageBlocks {
-			if content != "" {
-				m = m.updateSelected(content, "")
-				blocks = append(blocks, content)
+	for _, message := range m.app.Messages {
+		var content string
+		var cached bool
+
+		switch casted := message.Info.(type) {
+		case opencode.UserMessage:
+		userLoop:
+			for partIndex, part := range message.Parts {
+				switch part := part.(type) {
+				case opencode.TextPart:
+					remainingParts := message.Parts[partIndex+1:]
+					fileParts := make([]opencode.FilePart, 0)
+					for _, part := range remainingParts {
+						switch part := part.(type) {
+						case opencode.FilePart:
+							fileParts = append(fileParts, part)
+						}
+					}
+					flexItems := []layout.FlexItem{}
+					if len(fileParts) > 0 {
+						fileStyle := styles.NewStyle().Background(t.BackgroundElement()).Foreground(t.TextMuted()).Padding(0, 1)
+						mediaTypeStyle := styles.NewStyle().Background(t.Secondary()).Foreground(t.BackgroundPanel()).Padding(0, 1)
+						for _, filePart := range fileParts {
+							mediaType := ""
+							switch filePart.Mime {
+							case "text/plain":
+								mediaType = "txt"
+							case "image/png", "image/jpeg", "image/gif", "image/webp":
+								mediaType = "img"
+								mediaTypeStyle = mediaTypeStyle.Background(t.Accent())
+							case "application/pdf":
+								mediaType = "pdf"
+								mediaTypeStyle = mediaTypeStyle.Background(t.Primary())
+							}
+							flexItems = append(flexItems, layout.FlexItem{
+								View: mediaTypeStyle.Render(mediaType) + fileStyle.Render(filePart.Filename),
+							})
+						}
+					}
+					bgColor := t.BackgroundPanel()
+					files := layout.Render(
+						layout.FlexOptions{
+							Background: &bgColor,
+							Width:      width - 6,
+							Direction:  layout.Column,
+						},
+						flexItems...,
+					)
+
+					key := m.cache.GenerateKey(casted.ID, part.Text, width, m.selectedPart == m.partCount, files)
+					content, cached = m.cache.Get(key)
+					if !cached {
+						content = renderText(
+							m.app,
+							message.Info,
+							part.Text,
+							m.app.Config.Username,
+							m.showToolDetails,
+							m.partCount == m.selectedPart,
+							width,
+							files,
+						)
+						m.cache.Set(key, content)
+					}
+					if content != "" {
+						m = m.updateSelected(content, part.Text)
+						blocks = append(blocks, content)
+					}
+					// Only render the first text part
+					break userLoop
+				}
+			}
+
+		case opencode.AssistantMessage:
+			hasTextPart := false
+			for partIndex, p := range message.Parts {
+				switch part := p.(type) {
+				case opencode.TextPart:
+					hasTextPart = true
+					finished := casted.Time.Completed > 0
+					remainingParts := message.Parts[partIndex+1:]
+					toolCallParts := make([]opencode.ToolPart, 0)
+
+					// sometimes tool calls happen without an assistant message
+					// these should be included in this assistant message as well
+					if len(orphanedToolCalls) > 0 {
+						toolCallParts = append(toolCallParts, orphanedToolCalls...)
+						orphanedToolCalls = make([]opencode.ToolPart, 0)
+					}
+
+					remaining := true
+					for _, part := range remainingParts {
+						if !remaining {
+							break
+						}
+						switch part := part.(type) {
+						case opencode.TextPart:
+							// we only want tool calls associated with the current text part.
+							// if we hit another text part, we're done.
+							remaining = false
+						case opencode.ToolPart:
+							toolCallParts = append(toolCallParts, part)
+							if part.State.Status != opencode.ToolPartStateStatusCompleted || part.State.Status != opencode.ToolPartStateStatusError {
+								// i don't think there's a case where a tool call isn't in result state
+								// and the message time is 0, but just in case
+								finished = false
+							}
+						}
+					}
+
+					if finished {
+						key := m.cache.GenerateKey(casted.ID, part.Text, width, m.showToolDetails, m.selectedPart == m.partCount)
+						content, cached = m.cache.Get(key)
+						if !cached {
+							content = renderText(
+								m.app,
+								message.Info,
+								part.Text,
+								casted.ModelID,
+								m.showToolDetails,
+								m.partCount == m.selectedPart,
+								width,
+								"",
+								toolCallParts...,
+							)
+							m.cache.Set(key, content)
+						}
+					} else {
+						content = renderText(
+							m.app,
+							message.Info,
+							part.Text,
+							casted.ModelID,
+							m.showToolDetails,
+							m.partCount == m.selectedPart,
+							width,
+							"",
+							toolCallParts...,
+						)
+					}
+					if content != "" {
+						m = m.updateSelected(content, part.Text)
+						blocks = append(blocks, content)
+					}
+				case opencode.ToolPart:
+					if !m.showToolDetails {
+						if !hasTextPart {
+							orphanedToolCalls = append(orphanedToolCalls, part)
+						}
+						continue
+					}
+
+					if part.State.Status == opencode.ToolPartStateStatusCompleted || part.State.Status == opencode.ToolPartStateStatusError {
+						key := m.cache.GenerateKey(casted.ID,
+							part.ID,
+							m.showToolDetails,
+							width,
+							m.partCount == m.selectedPart,
+						)
+						content, cached = m.cache.Get(key)
+						if !cached {
+							content = renderToolDetails(
+								m.app,
+								part,
+								m.partCount == m.selectedPart,
+								width,
+							)
+							m.cache.Set(key, content)
+						}
+					} else {
+						// if the tool call isn't finished, don't cache
+						content = renderToolDetails(
+							m.app,
+							part,
+							m.partCount == m.selectedPart,
+							width,
+						)
+					}
+					if content != "" {
+						m = m.updateSelected(content, "")
+						blocks = append(blocks, content)
+					}
+				}
 			}
 		}
 
 		// Handle errors (copied from original logic)
 		error := ""
-		if assistant, ok := message.(opencode.AssistantMessage); ok {
+		if assistant, ok := message.Info.(opencode.AssistantMessage); ok {
 			switch err := assistant.Error.AsUnion().(type) {
 			case nil:
 			case opencode.AssistantMessageErrorMessageOutputLengthError:
@@ -708,7 +885,7 @@ func (m *messagesComponent) header(width int) string {
 	contextWindow := m.app.Model.Limit.Context
 
 	for _, message := range m.app.Messages {
-		if assistant, ok := message.(opencode.AssistantMessage); ok {
+		if assistant, ok := message.Info.(opencode.AssistantMessage); ok {
 			cost += assistant.Cost
 			usage := assistant.Tokens
 			if usage.Output > 0 {
